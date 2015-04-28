@@ -1,0 +1,136 @@
+#!/usr/bin/env ruby
+
+require 'open3'
+require 'optparse'
+require 'shellwords'
+
+def usage
+  puts <<-USAGE
+Usage: #$0 COMMAND [OPTIONS] [arg ...]
+Commands:
+    all                          List all vms
+    list  [VM]                   List the specified vm [Default: boot2docker-vm]
+    map   PORT | PORT1..PORT2    Map port for the specified vm
+    unmap PORT | PORT1..PORT2    Unmap port for the specified vm
+  USAGE
+end
+
+def usage_err
+  usage
+  exit!
+end
+
+def parse_options command
+  options = { adapter_id: 1, vm: 'boot2docker-vm', protocols: %w[tcp udp] }
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: #$0 #{command} [OPTIONS] [arg ...]"
+    opts.on '-a ADAPTER_ID', '--adapter ADAPTER_ID',
+            'Specify the network adapter id [Default: 1]' do |adapter_id|
+      options[:adapter_id] = adapter_id.to_i
+    end
+    opts.on '-m NAME', '--vm NAME',
+            'Specify the vm name [Default: boot2docker-vm]' do |vm|
+      options[:vm] = vm
+    end
+    opts.on '--tcp-only', 'Only map TCP port' do
+      options[:protocols] = %w[tcp]
+    end
+    opts.on '--udp-only', 'Only map UDP port' do
+      options[:protocols] = %w[udp]
+    end
+  end
+  parser.parse!
+  parser.parse! ['--help'] if ARGV.empty?
+  options
+end
+
+def output_cmd *args
+  puts ['VBoxManage', *args].shelljoin if ENV['DEBUG']
+  out, err, status = Open3.capture3('VBoxManage', *args)
+  if status.success?
+    yield out
+  else
+    STDERR.puts err
+    exit!
+  end
+end
+
+def exec_cmd *args
+  puts ['VBoxManage', *args].shelljoin if ENV['DEBUG']
+  exit! unless system('VBoxManage', *args)
+end
+
+def all_vms
+  output_cmd 'list', 'vms' do |output|
+    output.split("\n").
+           map { |str| str.gsub(/^"(.+)".+$/, '\1') }.each do |line|
+      puts line
+    end
+  end
+end
+
+def list_vm name
+  output_cmd 'showvminfo', name do |output|
+    regexp = /^NIC \d+ Rule.*:\s*/
+    output.split("\n").select { |line| line =~ regexp }.
+                       map { |line| line.gsub(regexp, '\1') }.each do |line|
+      puts line
+    end
+  end
+end
+
+def map_port port, name, adapter_id, protocol
+  exec_cmd 'controlvm', name, "natpf#{adapter_id}", "#{protocol}-port#{port},#{protocol},,#{port},,#{port}"
+end
+
+def unmap_port port, name, adapter_id, protocol
+  exec_cmd 'controlvm', name, "natpf#{adapter_id}", 'delete', "#{protocol}-port#{port}"
+end
+
+def parse_ports ports
+  ports.map do |port|
+    if port =~ /\A(\d+)\z/
+      $1.to_i
+    elsif port =~ /\A(\d+)\.\.(\d+)\z/
+      (($1.to_i)..($2.to_i)).to_a
+    elsif port =~ /\A(\d+)\.\.\.(\d+)\z/
+      (($1.to_i)...($2.to_i)).to_a
+    else
+      usage_err
+    end
+  end.flatten
+end
+
+Open3.popen3 'which', 'VBoxManage' do |_, _, _, pr|
+  unless pr.value.success?
+    STDERR.puts "Failed to find VBoxManage in PATH"
+    exit!
+  end
+end
+
+command = ARGV.shift
+
+case command
+when 'all'
+  all_vms
+when 'list'
+  list_vm ARGV.first || 'boot2docker-vm'
+when 'map'
+  options = parse_options 'map'
+  parse_ports(ARGV).each do |port|
+    options[:protocols].each do |protocol|
+      map_port port, options[:vm], options[:adapter_id], protocol
+    end
+  end
+when 'unmap'
+  options = parse_options 'ummap'
+  parse_ports(ARGV).each do |port|
+    options[:protocols].each do |protocol|
+      unmap_port port, options[:vm], options[:adapter_id], protocol
+    end
+  end
+when '--help'
+  usage
+else
+  usage_err
+end
